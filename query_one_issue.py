@@ -10,10 +10,10 @@ import time
 import argparse
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
-import requests
 from urllib.parse import urlparse
 from github_access import GitHubAPI
 from env_config import load_env_file, check_tokens_tuple
+from linear_access import LinearAPI
 
 @dataclass
 class Issue:
@@ -25,148 +25,6 @@ class Issue:
     github_number: Optional[int]
     github_repo: Optional[str]
     github_state: Optional[str]
-
-class LinearAPI:
-    def __init__(self, api_token: str):
-        self.api_token = api_token
-        self.base_url = "https://api.linear.app/graphql"
-        self.headers = {
-            "Authorization": api_token,
-            "Content-Type": "application/json"
-        }
-
-    def query(self, query: str, variables: dict = None) -> dict:
-        """Execute a GraphQL query against Linear API"""
-        payload = {"query": query, "variables": variables or {}}
-        response = requests.post(self.base_url, json=payload, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-
-    def get_moco_team_id(self) -> str:
-        """Get the team ID for MojoCompiler team"""
-        query = """
-        query {
-            teams {
-                nodes {
-                    id
-                    name
-                }
-            }
-        }
-        """
-        result = self.query(query)
-        for team in result["data"]["teams"]["nodes"]:
-            if team["name"] == "MojoCompiler":
-                return team["id"]
-        raise ValueError("MojoCompiler team not found")
-
-    def get_issue_by_id(self, issue_id: str) -> Optional[dict]:
-        """Get a single issue by its Linear ID"""
-        query = """
-        query GetIssue($issueId: String!) {
-            issue(id: $issueId) {
-                id
-                identifier
-                title
-                description
-                state {
-                    name
-                }
-                team {
-                    name
-                }
-                attachments {
-                    nodes {
-                        id
-                        title
-                        url
-                        subtitle
-                        metadata
-                    }
-                }
-                createdAt
-                updatedAt
-                assignee {
-                    name
-                    email
-                }
-                creator {
-                    name
-                    email
-                }
-                labels {
-                    nodes {
-                        name
-                        color
-                    }
-                }
-            }
-        }
-        """
-        variables = {"issueId": issue_id}
-        result = self.query(query, variables)
-        return result["data"]["issue"] if result["data"]["issue"] else None
-
-    def get_issue_by_identifier(self, identifier: str) -> Optional[dict]:
-        """Get a single issue by its identifier (e.g., MOCO-1233)"""
-        query = """
-        query GetIssues($filter: IssueFilter!) {
-            issues(filter: $filter) {
-                nodes {
-                    id
-                    identifier
-                    title
-                    description
-                    state {
-                        name
-                    }
-                    team {
-                        name
-                    }
-                    attachments {
-                        nodes {
-                            id
-                            title
-                            url
-                            subtitle
-                            metadata
-                        }
-                    }
-                    createdAt
-                    updatedAt
-                    assignee {
-                        name
-                        email
-                    }
-                    creator {
-                        name
-                        email
-                    }
-                    labels {
-                        nodes {
-                            name
-                            color
-                        }
-                    }
-                }
-            }
-        }
-        """
-        variables = {
-            "filter": {
-                "number": {
-                    "eq": int(identifier.split("-")[1])
-                },
-                "team": {
-                    "key": {
-                        "eq": identifier.split("-")[0]
-                    }
-                }
-            }
-        }
-        result = self.query(query, variables)
-        issues = result["data"]["issues"]["nodes"]
-        return issues[0] if issues else None
 
 def extract_all_github_links_detailed(issue_data: dict) -> List[Tuple[str, int, str, str, str]]:
     """Extract all GitHub repository and issue numbers from Linear issue data with detailed source info
