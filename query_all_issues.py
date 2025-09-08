@@ -3,7 +3,6 @@
 Script to query all Linear issues in the MOCO team and show their GitHub links in a table format.
 """
 
-import os
 import re
 import json
 import sys
@@ -13,6 +12,9 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 import requests
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from github_access import GitHubAPI, extract_first_attachment_github_link
+from env_config import load_env_file, check_tokens_tuple
 
 @dataclass
 class Issue:
@@ -41,23 +43,73 @@ class LinearAPI:
         response.raise_for_status()
         return response.json()
 
-    def get_moco_team_id(self) -> str:
-        """Get the team ID for MojoCompiler team"""
+    def get_all_teams(self) -> List[Dict]:
+        """Get all teams with their details"""
         query = """
         query {
             teams {
                 nodes {
                     id
                     name
+                    key
                 }
             }
         }
         """
         result = self.query(query)
-        for team in result["data"]["teams"]["nodes"]:
-            if team["name"] == "MojoCompiler":
-                return team["id"]
-        raise ValueError("MojoCompiler team not found")
+        return result["data"]["teams"]["nodes"]
+    
+    def get_team_by_identifier(self, identifier: str) -> Optional[Dict]:
+        """Get a team by its key (acronym) or name.
+        
+        Args:
+            identifier: Team key (e.g., 'MOCO', 'MOTO') or name (e.g., 'MojoCompiler')
+            
+        Returns:
+            Team dict with id, name, and key, or None if not found
+        """
+        # Try to find by key first (case-insensitive)
+        identifier_upper = identifier.upper()
+        query = """
+        query($teamKey: String!) {
+            teams(filter: { key: { eq: $teamKey } }) {
+                nodes {
+                    id
+                    name
+                    key
+                }
+            }
+        }
+        """
+        result = self.query(query, {"teamKey": identifier_upper})
+        teams = result["data"]["teams"]["nodes"]
+        if teams:
+            return teams[0]
+        
+        # If not found by key, try by name (case-sensitive)
+        query = """
+        query($teamName: String!) {
+            teams(filter: { name: { eq: $teamName } }) {
+                nodes {
+                    id
+                    name
+                    key
+                }
+            }
+        }
+        """
+        result = self.query(query, {"teamName": identifier})
+        teams = result["data"]["teams"]["nodes"]
+        if teams:
+            return teams[0]
+        
+        # If still not found, try case-insensitive name search
+        all_teams = self.get_all_teams()
+        for team in all_teams:
+            if team["name"].lower() == identifier.lower():
+                return team
+        
+        return None
 
     def get_issue_by_id(self, issue_id: str) -> Optional[dict]:
         """Get a single issue by its Linear ID"""
@@ -234,138 +286,23 @@ class LinearAPI:
 
         return issues, next_cursor
 
-class GitHubAPI:
-    def __init__(self, token: str = None):
-        self.token = token
-        self.base_url = "https://api.github.com"
-        self.headers = {}
-        if token:
-            self.headers["Authorization"] = f"token {token}"
 
-        # Rate limiting
-        self.last_request_time = 0
-        self.min_interval = 0.01  # Minimum seconds between requests
-
-    def _rate_limit(self):
-        """Simple rate limiting"""
-        current_time = time.time()
-        time_since_last = current_time - self.last_request_time
-        if time_since_last < self.min_interval:
-            time.sleep(self.min_interval - time_since_last)
-        self.last_request_time = time.time()
-
-    def get_issue_state(self, repo: str, issue_number: int) -> Optional[str]:
-        """Get the state of a GitHub issue"""
-        self._rate_limit()
-
-        url = f"{self.base_url}/repos/{repo}/issues/{issue_number}"
-        try:
-            response = requests.get(url, headers=self.headers)
-            if response.status_code == 404:
-                print(f"Issue {repo}#{issue_number} not found")
-                return None
-            elif response.status_code == 403:
-                print(f"Rate limited or access denied for {repo}#{issue_number}")
-                return "rate_limited"  # Special marker to skip this issue
-            response.raise_for_status()
-            return response.json().get("state")
-        except requests.RequestException as e:
-            print(f"Error fetching {repo}#{issue_number}: {e}")
-            return None
-
-    def get_issue_details(self, repo: str, issue_number: int, max_retries: int = 3) -> tuple[Optional[dict], str]:
-        """Get details of a GitHub issue including title and state with retry logic
-        Returns: (issue_details, status) where status is 'success', 'not_found', 'rate_limited', or 'error'
-        """
-        for attempt in range(max_retries):
-            self._rate_limit()
-
-            url = f"{self.base_url}/repos/{repo}/issues/{issue_number}"
-            try:
-                response = requests.get(url, headers=self.headers)
-                if response.status_code == 404:
-                    return None, 'not_found'
-                elif response.status_code == 403:
-                    # Rate limited - wait longer and retry
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 30  # 30, 60, 90 seconds
-                        print(f"Rate limited for {repo}#{issue_number}. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        print(f"Failed to fetch {repo}#{issue_number} after {max_retries} attempts due to rate limiting")
-                        return None, 'rate_limited'
-                response.raise_for_status()
-                data = response.json()
-                return {
-                    "id": data.get("id"),
-                    "number": data.get("number"),
-                    "title": data.get("title"),
-                    "state": data.get("state"),
-                    "html_url": data.get("html_url")
-                }, 'success'
-            except requests.RequestException as e:
-                if attempt < max_retries - 1:
-                    print(f"Error fetching {repo}#{issue_number} (attempt {attempt + 1}): {e}. Retrying...")
-                    time.sleep(5)
-                    continue
-                else:
-                    print(f"Error fetching {repo}#{issue_number} after {max_retries} attempts: {e}")
-                    return None, 'error'
-
-        return None, 'error'
-
-def extract_all_github_links(issue_data: dict) -> List[Tuple[str, int, str]]:
-    """Extract all GitHub repository and issue numbers from Linear issue data
-    Returns unique GitHub links only (deduplicated by repo and issue number)
+def process_github_link(github_api: 'GitHubAPI', linear_id: str, linear_status: str, linear_title: str,
+                       repo: str, issue_number: int, source: str) -> tuple[Optional[tuple], str]:
+    """Process a single GitHub link and return table row data if successful
+    Returns: (table_row_data, status) where status is 'success', 'not_found', 'rate_limited', or 'error'
     """
-    github_patterns = [
-        r"github\.com/([^/]+/[^/]+)/issues/(\d+)",
-        r"github\.com/([^/]+/[^/]+)/pull/(\d+)",
-    ]
+    github_details, status = github_api.get_issue_details(repo, issue_number)
 
-    found_links = []
-    seen_links = set()  # Track (repo, number) pairs to avoid duplicates
+    if status == 'success' and github_details and github_details.get('number'):
+        gh_number = str(github_details['number'])
+        gh_status = github_details['state']
+        gh_title = github_details['title']
+        # Include repo information for markdown links
+        table_row = (linear_id, linear_status, linear_title, gh_number, gh_status, gh_title, repo)
+        return table_row, status
 
-    # Check attachments
-    attachments = issue_data.get("attachments", {}).get("nodes", [])
-    for attachment in attachments:
-        url = attachment.get("url", "")
-        title = attachment.get("title", "")
-
-        for pattern in github_patterns:
-            match = re.search(pattern, url)
-            if match:
-                if len(match.groups()) == 2:
-                    repo, number = match.groups()
-                    link_key = (repo, int(number))
-                    if link_key not in seen_links:
-                        seen_links.add(link_key)
-                        found_links.append((repo, int(number), url))
-
-        # Check title for issue numbers
-        for pattern in github_patterns:
-            match = re.search(pattern, title)
-            if match:
-                if len(match.groups()) == 2:
-                    repo, number = match.groups()
-                    link_key = (repo, int(number))
-                    if link_key not in seen_links:
-                        seen_links.add(link_key)
-                        found_links.append((repo, int(number), f"title: {title}"))
-
-    # Check description
-    description = issue_data.get("description", "") or ""
-    for pattern in github_patterns:
-        for match in re.finditer(pattern, description):
-            if len(match.groups()) == 2:
-                repo, number = match.groups()
-                link_key = (repo, int(number))
-                if link_key not in seen_links:
-                    seen_links.add(link_key)
-                    found_links.append((repo, int(number), f"description: {match.group(0)}"))
-
-    return found_links
+    return None, status
 
 def truncate_text(text: str, max_length: int) -> str:
     """Truncate text to max_length characters, adding ellipsis if truncated"""
@@ -377,75 +314,166 @@ def truncate_text(text: str, max_length: int) -> str:
 
 def print_table_header():
     """Print the table header with proper formatting"""
-    print("+" + "-" * 15 + "+" + "-" * 12 + "+" + "-" * 42 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 42 + "+")
-    print(f"| {'Linear ID':<13} | {'Status':<10} | {'Linear Title':<40} | {'GH ID':<10} | {'GH Status':<10} | {'GH Title':<40} |")
-    print("+" + "-" * 15 + "+" + "-" * 12 + "+" + "-" * 42 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 42 + "+")
+    print("+" + "-" * 15 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 42 + "+" + "-" * 42 + "+")
+    print(f"| {'Linear ID':<13} | {'Status':<10} | {'GH Status':<10} | {'GH Number':<10} | {'Linear Title':<40} | {'GH Title':<40} |")
+    print("+" + "-" * 15 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 42 + "+" + "-" * 42 + "+")
 
 def print_table_row(linear_id: str, linear_status: str, linear_title: str,
-                   gh_id: str, gh_status: str, gh_title: str):
+                   gh_number: str, gh_status: str, gh_title: str, repo: str = ""):
     """Print a single table row with proper formatting"""
-    print(f"| {truncate_text(linear_id, 13):<13} | {truncate_text(linear_status, 10):<10} | {truncate_text(linear_title, 40):<40} | {truncate_text(gh_id, 10):<10} | {truncate_text(gh_status, 10):<10} | {truncate_text(gh_title, 40):<40} |")
+    print(f"| {truncate_text(linear_id, 13):<13} | {truncate_text(linear_status, 10):<10} | {truncate_text(gh_status, 10):<10} | {truncate_text(gh_number, 10):<10} | {truncate_text(linear_title, 40):<40} | {truncate_text(gh_title, 40):<40} |")
 
 def print_table_footer():
     """Print the table footer"""
-    print("+" + "-" * 15 + "+" + "-" * 12 + "+" + "-" * 42 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 42 + "+")
+    print("+" + "-" * 15 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 42 + "+" + "-" * 42 + "+")
 
-def load_env_file():
-    """Load environment variables from .env file if it exists"""
-    env_file = os.path.join(os.path.dirname(__file__), '.env')
-    if os.path.exists(env_file):
-        print(f"Loading environment variables from {env_file}")
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    # Remove quotes if present
-                    value = value.strip().strip('"').strip("'")
-                    os.environ[key.strip()] = value
-        print("Environment variables loaded successfully")
-    else:
-        print(f"Warning: .env file not found at {env_file}")
-        print("You can create a .env file with your API tokens:")
-        print("LINEAR_API_TOKEN=your_linear_token_here")
-        print("GITHUB_TOKEN=your_github_token_here")
+def create_markdown_table(table_rows) -> str:
+    """Create a markdown table from the table rows data"""
+    if not table_rows:
+        return "No results to display.\n"
+    
+    # Markdown table header
+    markdown = "| Linear Issue | Status | GH Status | GH Issue | Linear Title | GH Title |\n"
+    markdown += "|--------------|--------|-----------|----------|--------------|----------|\n"
+    
+    # Process each row
+    for linear_id, linear_status, linear_title, gh_number, gh_status, gh_title, repo in table_rows:
+        # Create Linear link
+        linear_link = f"[{linear_id}](https://linear.app/modularml/issue/{linear_id})"
+        
+        # Create GitHub link using the actual repo
+        gh_link = f"[#{gh_number}](https://github.com/{repo}/issues/{gh_number})"
+        
+        # Escape markdown special characters and truncate text
+        linear_title_escaped = linear_title.replace("|", "\\|").replace("\n", " ")[:35]
+        gh_title_escaped = gh_title.replace("|", "\\|").replace("\n", " ")[:35]
+        
+        # Add ellipsis if truncated
+        if len(linear_title) > 35:
+            linear_title_escaped += "..."
+        if len(gh_title) > 35:
+            gh_title_escaped += "..."
+        
+        markdown += f"| {linear_link} | {linear_status} | {gh_status} | {gh_link} | {linear_title_escaped} | {gh_title_escaped} |\n"
+    
+    return markdown
+
+
+# Define filtered status pairs (Linear status, GitHub status)
+# These are considered "matching" or "expected" combinations
+FILTERED_STATUS_PAIRS = {
+    ("done", "closed"),           # Completed work, properly closed
+    ("backlog", "open"),          # Future work, appropriately open
+    ("canceled", "closed"),       # Canceled work, properly closed
+    ("in review", "open"),        # Under review, still being worked on
+    ("todo", "open"),             # Planned work, appropriately still open
+    ("in progress", "open"),      # Active work, appropriately still open
+    ("duplicate", "closed"),      # Duplicate issues, properly closed
+    ("will not fix", "closed"),   # Won't fix issues, properly closed
+    ("triage", "open"),           # Issues being triaged, appropriately still open
+}
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Query all Linear issues in the MOCO team and show their GitHub links")
+    # Build help text from filtered pairs
+    filtered_pairs_text = ", ".join([f"{linear}+{github}" for linear, github in FILTERED_STATUS_PAIRS])
+    
+    parser = argparse.ArgumentParser(
+        description="""
+Query all Linear issues in a specified team and analyze their mirrored GitHub issues.
+This script helps identify status mismatches between Linear and GitHub issues.
+
+The script extracts the first GitHub issue link from each Linear issue's attachments
+(which represents the mirrored GitHub issue) and compares their statuses.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  %(prog)s                              # Show status mismatches in console table
+  %(prog)s --show-all                   # Show all issues including matching status pairs
+  %(prog)s --stop-after 50              # Process only first 50 Linear issues (debugging)
+  %(prog)s --markdown report.md         # Save results to markdown file with clickable links
+  %(prog)s --show-all --markdown all.md # Save complete report to markdown
+
+Filtered Status Pairs (hidden by default):
+  {filtered_pairs_text}
+
+Environment Variables:
+  LINEAR_API_TOKEN    Required. Get from https://linear.app/settings/api
+  GITHUB_TOKEN        Optional. Get from https://github.com/settings/tokens
+                      (Recommended for higher API rate limits)
+
+Configuration:
+  Create a .env file in the script directory with:
+    LINEAR_API_TOKEN=your_linear_token_here
+    GITHUB_TOKEN=your_github_token_here
+""")
+    
+    parser.add_argument("--stop-after", 
+                       type=int, 
+                       metavar="N",
+                       help="Stop after processing N Linear issues. Useful for debugging or quick testing. "
+                            "The script will fetch Linear issues in batches and stop once N issues are collected.")
+    
+    parser.add_argument("--show-all", 
+                       action="store_true", 
+                       help=f"Show all status combinations including matching pairs. "
+                            f"By default, {len(FILTERED_STATUS_PAIRS)} 'expected' status pairs are hidden "
+                            f"to focus on potential mismatches. Use this flag to see everything.")
+    
+    parser.add_argument("--markdown", 
+                       type=str, 
+                       metavar="FILENAME", 
+                       help="Save output in markdown format to the specified file. "
+                            "Creates a professional report with clickable links to Linear issues "
+                            "(https://linear.app/modularml/issue/ISSUE-ID) and GitHub issues "
+                            "(https://github.com/REPO/issues/NUMBER). Includes summary statistics "
+                            "and formatted table.")
+    
+    parser.add_argument("--team-name",
+                       type=str,
+                       default="MOCO",
+                       help="Team identifier (key/acronym like MOCO, MOTO, MSTDL) or full team name "
+                            "(like 'MojoCompiler', 'Mojo Tooling'). Case-insensitive for keys. "
+                            "Default: MOCO (MojoCompiler team)")
+    
     args = parser.parse_args()
 
-    # Load environment variables from .env file if it exists
-    load_env_file()
+    # Load environment variables from .env file
+    tokens = load_env_file()
 
-    # Get API tokens from environment variables
-    linear_token = os.getenv("LINEAR_API_TOKEN")
-    github_token = os.getenv("GITHUB_TOKEN")  # Optional but recommended for higher rate limits
-
-    if not linear_token:
-        print("Error: LINEAR_API_TOKEN environment variable is required")
-        print("Add it to your .env file or get your token from: https://linear.app/settings/api")
-        print("Example .env file:")
-        print("LINEAR_API_TOKEN=your_linear_token_here")
+    # Check if required tokens are present
+    if not check_tokens_tuple(tokens):
         return 1
 
-    if not github_token:
-        print("Warning: GITHUB_TOKEN not set. You'll have lower rate limits.")
-        print("Add it to your .env file or get your token from: https://github.com/settings/tokens")
-        print("Add to .env file: GITHUB_TOKEN=your_github_token_here")
-
     # Initialize APIs
-    linear = LinearAPI(linear_token)
-    github = GitHubAPI(github_token)
+    linear = LinearAPI(tokens.linear_token)
+    github = GitHubAPI(tokens.github_token)
 
     try:
-        # Get MojoCompiler team ID
-        print("Getting MojoCompiler team ID...")
-        team_id = linear.get_moco_team_id()
-        print(f"Found team ID: {team_id}")
+        # Get team by identifier
+        print(f"Looking up team: {args.team_name}...")
+        team = linear.get_team_by_identifier(args.team_name)
+        
+        if not team:
+            print(f"Error: Team '{args.team_name}' not found.")
+            print("\nAvailable teams:")
+            all_teams = linear.get_all_teams()
+            for t in sorted(all_teams, key=lambda x: x['key']):
+                print(f"  {t['key']:10} - {t['name']}")
+            return 1
+        
+        team_id = team['id']
+        team_key = team['key']
+        team_name = team['name']
+        print(f"Found team: {team_name} (key: {team_key}, id: {team_id})")
 
-        # Collect all team issues
-        print("Fetching all MOCO issues (page size: 200)...")
+        # Collect team issues (with optional limit)
+        if args.stop_after:
+            print(f"Fetching {team_key} issues (page size: 200, stopping after {args.stop_after})...")
+        else:
+            print(f"Fetching all {team_key} issues (page size: 200)...")
+
         all_issues = []
         cursor = None
 
@@ -454,62 +482,162 @@ def main():
             all_issues.extend(issues)
             print(f"Fetched {len(issues)} issues (total: {len(all_issues)})")
 
+            # Check if we should stop due to --stop-after limit
+            if args.stop_after and len(all_issues) >= args.stop_after:
+                all_issues = all_issues[:args.stop_after]  # Trim to exact limit
+                print(f"DEBUG MODE: Stopped after fetching {len(all_issues)} issues")
+                break
+
             if not next_cursor:
                 break
             cursor = next_cursor
             time.sleep(0.25)  # Be nice to the API
 
-        print(f"Total issues found: {len(all_issues)}")
-        print(f"Processing GitHub links for {len(all_issues)} issues...")
+        # Phase 1: Collect GitHub links to process (only first attachment link per Linear issue)
+        print(f"Processing {len(all_issues)} Linear issues...")
+        print("Extracting mirrored GitHub issues (first attachment link only)...")
 
-        # Phase 1: Process all GitHub links and collect valid entries
-        table_rows = []
+        github_tasks = []  # List of (linear_info, github_info) tuples to process
         issues_with_gh_links = 0
-        rate_limit_hits = 0
 
-        for i, issue_data in enumerate(all_issues):
-            # Extract GitHub links
-            github_links = extract_all_github_links(issue_data)
+        for issue_data in all_issues:
+            # Only get the first GitHub link from attachments (mirrored issue)
+            github_link = extract_first_attachment_github_link(issue_data)
 
-            linear_id = issue_data['identifier']
-            linear_status = issue_data['state']['name']
-            linear_title = issue_data['title']
-
-            has_gh_links = bool(github_links)
-            if has_gh_links:
+            if github_link:
                 issues_with_gh_links += 1
+                linear_id = issue_data['identifier']
+                linear_status = issue_data['state']['name']
+                linear_title = issue_data['title']
 
-            if github_links:
-                # Process each GitHub link
-                for repo, issue_number, source in github_links:
-                    github_details, status = github.get_issue_details(repo, issue_number)
+                repo, issue_number, source = github_link
+                github_tasks.append((linear_id, linear_status, linear_title, repo, issue_number, source))
 
-                    # Track rate limit hits specifically
-                    if status == 'rate_limited':
+        print(f"Found {len(github_tasks)} mirrored GitHub issues from {issues_with_gh_links} Linear issues")
+        print("Processing GitHub API requests in parallel...")
+
+        # Phase 2: Process GitHub links in parallel
+        table_rows = []
+        rate_limit_hits = 0
+        processed_count = 0
+        error_reports = []  # Collect error reports for problematic links
+
+        # Use ThreadPoolExecutor for parallel processing
+        # Limit concurrent requests to avoid overwhelming GitHub API
+        max_workers = 10 if tokens.github_token else 5  # More workers with auth token
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_task = {
+                executor.submit(process_github_link, github, linear_id, linear_status, linear_title, repo, issue_number, source):
+                (linear_id, linear_status, linear_title, repo, issue_number, source)
+                for linear_id, linear_status, linear_title, repo, issue_number, source in github_tasks
+            }
+
+            # Process completed requests
+            for future in as_completed(future_to_task):
+                processed_count += 1
+                linear_id, linear_status, linear_title, repo, issue_number, source = future_to_task[future]
+
+                try:
+                    table_row, status = future.result()
+
+                    if status == 'success' and table_row:
+                        table_rows.append(table_row)
+                    elif status == 'rate_limited':
                         rate_limit_hits += 1
+                        error_reports.append(f"RATE LIMITED: {linear_id} → {repo}#{issue_number} (after retries)")
+                    elif status == 'not_found':
+                        error_reports.append(f"NOT FOUND: {linear_id} → {repo}#{issue_number} (GitHub issue does not exist)")
+                    elif status == 'error':
+                        error_reports.append(f"ERROR: {linear_id} → {repo}#{issue_number} (network/API error)")
 
-                    # Only add to table if we successfully got GitHub issue details
-                    if status == 'success' and github_details and github_details.get('id'):
-                        gh_id = str(github_details['id'])
-                        gh_status = github_details['state']
-                        gh_title = github_details['title']
-                        table_rows.append((linear_id, linear_status, linear_title, gh_id, gh_status, gh_title))
+                except Exception as e:
+                    error_reports.append(f"EXCEPTION: {linear_id} → {repo}#{issue_number} (Python error: {e})")
 
-            # Print progress every 50 issues
-            if (i + 1) % 50 == 0:
-                processed_in_batch = 50
-                gh_links_in_batch = sum(1 for j in range(i - 49, i + 1) if j >= 0 and extract_all_github_links(all_issues[j]))
-                print(f"Processed {processed_in_batch} issues, of those {gh_links_in_batch:2d} had GH links, hit rate limit {rate_limit_hits:2d} times. Total {i + 1:3d}/{len(all_issues)} issues.")
-                rate_limit_hits = 0  # Reset counter for next batch
+                # Print progress every 50 completed requests
+                if processed_count % 50 == 0:
+                    print(f"Processed {processed_count:3d}/{len(github_tasks)} GitHub links, found {len(table_rows):3d} valid, hit rate limit {rate_limit_hits:2d} times.")
 
-        # Phase 2: Display the table
-        print(f"\nFound {len(table_rows)} Linear issues with valid GitHub links")
-        print_table_header()
+        print(f"Completed processing {processed_count} GitHub links")
 
-        for row in table_rows:
-            print_table_row(*row)
+        # Print error reports if any
+        if error_reports:
+            print(f"\n⚠️  ERROR REPORT: {len(error_reports)} problematic GitHub links found:")
+            print("-" * 80)
+            for error in sorted(error_reports):  # Sort for consistent output
+                print(error)
+            print("-" * 80)
 
-        print_table_footer()
+        # Phase 3: Filter and display the table
+        # Sort by Linear ID with proper numeric ordering (MOCO-29 before MOCO-289)
+        def sort_key(row):
+            linear_id = row[0]  # e.g., "MOCO-123"
+            if '-' in linear_id:
+                prefix, number_str = linear_id.split('-', 1)
+                try:
+                    number = int(number_str)
+                    return (prefix, number)
+                except ValueError:
+                    # Fallback to string sorting if number parsing fails
+                    return (prefix, number_str)
+            else:
+                # Fallback for IDs without dashes
+                return (linear_id, 0)
+        
+        table_rows.sort(key=sort_key)
+        
+        # Apply filtering unless --show-all is specified
+        if not args.show_all:
+            original_count = len(table_rows)
+            filtered_rows = []
+            for row in table_rows:
+                linear_id, linear_status, linear_title, gh_number, gh_status, gh_title, repo = row
+                
+                # Check if this status pair should be filtered
+                status_pair = (linear_status.lower(), gh_status.lower())
+                if status_pair in FILTERED_STATUS_PAIRS:
+                    continue  # Skip this row as it's a matching/expected status combination
+                    
+                filtered_rows.append(row)
+            
+            table_rows = filtered_rows
+            filtered_count = original_count - len(table_rows)
+            if filtered_count > 0:
+                print(f"\nFiltered out {filtered_count} rows ({len(FILTERED_STATUS_PAIRS)} matching status pairs). Use --show-all to see all.")
+
+        # Output results
+        if args.markdown:
+            # Save to markdown file
+            markdown_content = f"# Linear-GitHub Issue Status Report\n\n"
+            markdown_content += f"**Generated on:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            markdown_content += f"**Summary:**\n"
+            markdown_content += f"- Total Linear issues processed: {len(all_issues)}\n"
+            markdown_content += f"- Issues that had mirrored GitHub links: {issues_with_gh_links}\n"
+            markdown_content += f"- Issues with valid GitHub links: {len(table_rows)}\n\n"
+            
+            if not args.show_all:
+                markdown_content += f"**Note:** Filtered out {original_count - len(table_rows) if 'original_count' in locals() else 0} matching status pairs. Use --show-all to include all.\n\n"
+            
+            markdown_content += f"## Results ({len(table_rows)} issues)\n\n"
+            markdown_content += create_markdown_table(table_rows)
+            
+            # Write to file
+            with open(args.markdown, 'w', encoding='utf-8') as f:
+                f.write(markdown_content)
+            
+            print(f"Results saved to {args.markdown}")
+            print(f"Found {len(table_rows)} Linear issues with valid mirrored GitHub issues")
+        else:
+            # Regular console output
+            print(f"\nShowing {len(table_rows)} Linear issues with valid mirrored GitHub issues")
+            print_table_header()
+
+            for row in table_rows:
+                print_table_row(*row)
+
+            print_table_footer()
+        
         print(f"\nTotal Linear issues processed: {len(all_issues)}")
         print(f"Issues that had GitHub links: {issues_with_gh_links}")
         print(f"Issues with valid GitHub links: {len(table_rows)}")
