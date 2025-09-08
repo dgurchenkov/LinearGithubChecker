@@ -151,16 +151,6 @@ Options:
 
 The tools support all Linear teams. Common teams include:
 
-| Acronym | Team Name |
-|---------|-----------|
-| `MOCO` | MojoCompiler |
-| `MOTO` | Mojo Tooling |
-| `MSTDL` | Mojo Standard Library |
-| `DOCS` | Docs |
-| `KERN` | Kernel |
-| `GEX` | Graph Execution |
-| `INFRA` | InfraPlatform |
-
 To see all available teams:
 ```bash
 python query_all_issues.py --team-name INVALID_TEAM
