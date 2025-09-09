@@ -4,6 +4,8 @@ Python utilities for identifying status mismatches between Linear issues and the
 
 **Note**: This project is unlikely to be useful to anyone else unless they use the same combination of issue trackers (Linear + GitHub) with similar mirroring setup.
 
+This entire tool was created by Claude (Anthropic's AI assistant) through Claude Code. This is a 100% AI-generated, vibe-coded application. No human made any direct changes to the code - all implementation, refactoring, and optimization was done by AI based on conversational requirements and feedback.
+
 ## Overview
 
 Two scripts for analyzing Linear-GitHub issue synchronization:
